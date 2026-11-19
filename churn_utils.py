@@ -121,3 +121,21 @@ def segment_summary(results: pd.DataFrame):
                  **{"Average Churn Probability": ("Churn Probability", "mean"),
                     "Predicted High Risk": ("Predicted Churn Value", "sum")})
             .reset_index().sort_values("Customer Segment"))
+
+
+def make_outreach_shortlist(filtered: pd.DataFrame, capacity: int, sort_column: str) -> pd.DataFrame:
+    """Return up to capacity prefiltered customers for human review.
+
+    Sorting is stable; tied scores retain input order. No claim of treatment uplift.
+    """
+    if not isinstance(capacity, (int, np.integer)) or capacity < 1:
+        raise ValueError("Outreach capacity must be a positive integer")
+    if sort_column not in filtered.columns:
+        raise KeyError(f"Unknown ranking column: {sort_column}")
+    shortlist = filtered.sort_values(sort_column, ascending=False, kind="mergesort").head(capacity).copy()
+    shortlist.insert(0, "Review Priority", np.arange(1, len(shortlist) + 1))
+    if "CustomerID" not in shortlist.columns:
+        shortlist.insert(1, "Source Row Number", shortlist.index.to_numpy() + 2)
+    shortlist["Outreach Status"] = "Not reviewed"
+    shortlist["Agent Notes"] = ""
+    return shortlist

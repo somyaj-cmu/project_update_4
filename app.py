@@ -6,11 +6,24 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from churn_utils import validate_and_prepare, predict_customers, apply_threshold, segment_summary
+from churn_utils import validate_and_prepare, predict_customers, apply_threshold, segment_summary, make_outreach_shortlist
 
 st.set_page_config(page_title="Customer Churn & Retention Dashboard", page_icon="📊", layout="wide")
 st.title("Customer Churn & Retention Dashboard")
-st.caption("Predict churn, understand customer segments, and prioritize retention opportunities.")
+st.caption("Estimate churn risk, review customer segments, and prepare an outreach shortlist.")
+
+st.info("**Intended workflow:** A retention agent uploads a batch of **currently active** customers "
+        "during a periodic outreach-planning cycle, reviews data-quality warnings, and "
+        "selects a limited number of customers for manual review. Only information known "
+        "**before** the outreach decision should be provided. This is decision support, "
+        "not an automated retention-offer recommendation.")
+with st.expander("Prediction timing and dataset limitations", expanded=False):
+    st.write("The historical Telco dataset contains churn outcomes but does not establish "
+             "a timestamped pre-churn feature snapshot or a defined prediction window. "
+             "Therefore this model has **not** been validated to predict churn over the "
+             "next 30, 60, or 90 days. Use currently active accounts only for the "
+             "intended workflow; the app cannot independently verify active status.")
+
 
 MODEL_PATH = Path(__file__).with_name("model.pkl")
 
@@ -49,6 +62,13 @@ except (pd.errors.ParserError, UnicodeError, ValueError, pd.errors.EmptyDataErro
 
 st.subheader("1. Data quality assessment")
 st.write(f"Uploaded **{len(original):,} customers** with **{len(original.columns)} columns**.")
+outcome_fields = [c for c in ["Churn Value", "Churn Label", "Churn Reason", "Churn Score", "Churn Category"]
+                  if c in original.columns]
+if outcome_fields:
+    st.warning("Outcome/leakage-prone columns detected: " + ", ".join(outcome_fields) + ". "
+               "They are not model predictors. Use a snapshot of active customers rather than "
+               "records of people who have already left. Do not interpret these columns as "
+               "information available at the time of an outreach decision.")
 x, issues, flags, errors = validate_and_prepare(original, model)
 if errors:
     for error in errors:
@@ -81,7 +101,12 @@ else:
 
 # Predictions are computed once per upload; threshold/filter changes do not retrain or re-score the model.
 # Validated features and model are deterministic. Cached data is not persisted between user sessions.
-if st.button("Generate churn predictions", type="primary"):
+active_confirmed = st.checkbox(
+    "I confirm that this file is intended to represent currently active customers and "
+    "that input features were available before the intended outreach decision.",
+    help="The app cannot verify account status or when each feature was recorded. "
+         "This confirmation describes the intended use, not a guarantee of data quality.")
+if st.button("Generate churn predictions", type="primary", disabled=not active_confirmed):
     try:
         st.session_state["predictions"] = predict_customers(original, x, flags, model)
         st.session_state["file_id"] = (upload.name, upload.size, upload.getvalue())
@@ -90,7 +115,7 @@ if st.button("Generate churn predictions", type="primary"):
 
 file_id = (upload.name, upload.size, upload.getvalue())
 if st.session_state.get("file_id") != file_id:
-    st.info("Review the data quality report, then select **Generate churn predictions**.")
+    st.info("Review the data quality report, confirm the intended input snapshot, then select **Generate churn predictions**.")
     st.stop()
 
 st.subheader("2. Risk threshold and summary")
@@ -104,7 +129,9 @@ a.metric("Customers analyzed", f"{len(results):,}")
 b.metric("Predicted to churn", f"{results['Predicted Churn Value'].sum():,}")
 c.metric("Average predicted churn", f"{results['Churn Probability'].mean():.1%}")
 d.metric("Affected by imputation", f"{rows_affected:,}")
-st.caption("These are predictions, not observed churn rates. Threshold changes require labeled data for new accuracy/recall estimates.")
+st.caption("Probabilities are model estimates, not certainties or observed churn rates. "
+           "The chosen threshold changes labels, not model scores; labeled data is needed "
+           "to evaluate precision and recall at a new threshold.")
 
 st.subheader("3. Segment-level analysis")
 segment = segment_summary(results)
@@ -153,12 +180,47 @@ other_cols = [c for c in filtered.columns if c not in col_order]
 st.dataframe(filtered[col_order + other_cols], hide_index=True, use_container_width=True,
              column_config={"Churn Probability": st.column_config.ProgressColumn(
                  "Churn Probability", format="%.1f", min_value=0, max_value=1)})
-st.caption("Expected value at risk = predicted churn probability × supplied CLTV. "
-           "This is a prioritization proxy, not a causal estimate of preventable loss or retention ROI.")
+st.caption("The risk × CLTV value is a **ranking proxy**, not a monetary forecast of "
+           "preventable losses or a measure of retention ROI. Higher-risk customers are "
+           "not necessarily more likely to respond to outreach.")
 st.download_button("Download filtered predictions (CSV)", filtered.to_csv(index=False).encode("utf-8"),
                    "churn_predictions.csv", "text/csv", use_container_width=True)
 
-st.subheader("5. Global model interpretation")
+st.subheader("5. Outreach capacity and review shortlist")
+st.write("Choose how many customers the team can review or contact. The app ranks only "
+         "customers matching your selected risk and segment filters. This is a "
+         "**review list**, not a claim that an incentive will prevent churn.")
+capacity = st.number_input("Maximum customers to prioritize", min_value=1,
+                           max_value=max(1, len(results)), value=min(25, max(1, len(results))), step=1)
+shortlist = make_outreach_shortlist(filtered, capacity=int(capacity), sort_column=sort_col)
+qleft, qright = st.columns(2)
+qleft.metric("Eligible after filters", f"{len(filtered):,}")
+qright.metric("Selected for review", f"{len(shortlist):,}")
+if shortlist.empty:
+    st.warning("No customers match the current filters. Broaden the risk/segment selection.")
+else:
+    display_cols = ([c for c in ["Review Priority", "CustomerID", "Churn Probability", "Risk Category",
+                                  "Customer Segment", "CLTV", "Expected Value at Risk (proxy)",
+                                  "Data Quality Flag", "Outreach Status", "Agent Notes"]
+                     if c in shortlist.columns])
+    st.dataframe(shortlist[display_cols], hide_index=True, use_container_width=True)
+    st.download_button("Download prioritized outreach review list (CSV)",
+                       shortlist.to_csv(index=False).encode("utf-8"),
+                       "outreach_review_shortlist.csv", "text/csv", use_container_width=True)
+    st.caption("Outreach Status is initialized to 'Not reviewed'. Update the downloaded "
+               "CSV in your team's approved customer-management system. In-app statuses "
+               "are not saved or synchronized across agents.")
+
+st.subheader("6. Model uncertainty and appropriate use")
+with st.expander("Read before using predictions for retention decisions", expanded=True):
+    st.markdown("""- **Estimated risk is not certainty.** A churn probability is a model estimate, and it may be miscalibrated for new customers or periods.
+- **Prediction horizon is unverified.** The historical dataset does not establish whether the model predicts departures in a particular future interval.
+- **Input quality matters.** Missing or invalid fields are flagged and imputed from training data; unfamiliar customer types or changes over time may reduce reliability.
+- **Associations are not causes.** Model coefficients and segment patterns do not prove why a specific customer might leave.
+- **Churn risk is not uplift.** The model does not predict who will respond to a discount, call, or retention offer. An agent should review customer context and follow existing eligibility and consent policies before acting.
+- **Capacity ranking is a heuristic.** The top-N shortlist prioritizes review, not guaranteed savings, fairness, or optimal intervention selection.""")
+
+st.subheader("7. Global model interpretation")
 with st.expander("View logistic regression coefficients and caveats"):
     names = list(model["preprocessor"].get_feature_names_out()) + [
         f"Cluster {i+1} indicator" for i in range(model["cluster_count"])]
@@ -169,4 +231,5 @@ with st.expander("View logistic regression coefficients and caveats"):
     st.dataframe(importance.head(20), hide_index=True, use_container_width=True)
     st.caption("Positive coefficients are associated with higher predicted churn log-odds, "
                "holding other encoded inputs constant. These are associations, not causal effects. "
-               "One-hot categories and correlated cluster indicators complicate interpretation.")
+               "One-hot categories and correlated cluster indicators complicate interpretation. "
+               "They do not establish the effect of any proposed retention action.")
